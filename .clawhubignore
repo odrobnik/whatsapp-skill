@@ -1,0 +1,14 @@
+.git/
+.DS_Store
+node_modules/
+*.log
+.env
+auth/
+*.db
+*.db-*
+inbox.jsonl
+outbox/
+wa-qr.png
+creds.json
+# GitHub-only docs (SKILL.md serves as ClawHub readme)
+README.md

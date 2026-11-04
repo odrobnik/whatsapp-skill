@@ -1,0 +1,15 @@
+node_modules/
+.DS_Store
+*.log
+# Runtime state belongs in ~/.wa-bridge, never in the repository
+auth/
+*.db
+*.db-*
+inbox.jsonl
+outbox/
+status.json
+daemon.pid
+new.cursor
+wa-qr.png
+creds.json
+.env
