@@ -2,6 +2,8 @@
 // WhatsApp bridge (Baileys / WhatsApp Web linked device). Never prints credentials.
 import fs from 'node:fs'; import path from 'node:path'; import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+// libsignal console.info()s whole session records (incl. private keys); never let them reach logs.
+if (!/^(debug|trace)$/.test(process.env.WA_LOG || '')) console.info = () => {};
 
 const HOME = process.env.WA_BRIDGE_DIR
   ? path.resolve(process.env.WA_BRIDGE_DIR.replace(/^~(?=$|\/)/, os.homedir()))
@@ -26,7 +28,31 @@ function db() {
   CREATE TABLE IF NOT EXISTS messages(id TEXT, jid TEXT, from_me INTEGER, sender TEXT, push_name TEXT, ts INTEGER, type TEXT, text TEXT, PRIMARY KEY(jid,id));
   CREATE INDEX IF NOT EXISTS m_ts ON messages(jid, ts);`);
   try { fs.chmodSync(DB, 0o600); } catch {}
+  mergeLids(d);
   return d;
+}
+
+// Baileys 7 may address 1:1 chats by LID (…@lid). Fold those into the phone-number JID when known.
+function mergeLids(d) {
+  const pairs = d.prepare(`SELECT lid, jid FROM contacts WHERE lid LIKE '%@lid' AND jid LIKE '%@s.whatsapp.net'
+    UNION SELECT jid AS lid, pn AS jid FROM contacts WHERE jid LIKE '%@lid' AND pn LIKE '%@s.whatsapp.net'`).all();
+  if (!pairs.length) return;
+  d.exec('BEGIN');
+  for (const { lid, jid } of pairs) {
+    d.prepare('UPDATE OR IGNORE messages SET jid=? WHERE jid=?').run(jid, lid);
+    d.prepare('DELETE FROM messages WHERE jid=?').run(lid);
+    d.prepare('UPDATE messages SET sender=? WHERE sender=?').run(jid, lid);
+    const c = d.prepare('SELECT * FROM chats WHERE jid=?').get(lid);
+    if (c) { d.prepare(`INSERT INTO chats(jid,name,last_ts,unread) VALUES(?,?,?,?) ON CONFLICT(jid) DO UPDATE SET last_ts=MAX(COALESCE(excluded.last_ts,0),COALESCE(chats.last_ts,0)), name=COALESCE(chats.name,excluded.name)`).run(jid, c.name, c.last_ts, c.unread);
+      d.prepare('DELETE FROM chats WHERE jid=?').run(lid); }
+  }
+  d.exec('COMMIT');
+}
+function lidToPn(d, jid, alt) {
+  if (!jid || !jid.endsWith('@lid')) return jid;
+  if (alt && alt.endsWith('@s.whatsapp.net')) return alt;
+  return d.prepare(`SELECT jid FROM contacts WHERE lid=? AND jid LIKE '%@s.whatsapp.net'`).get(jid)?.jid
+    || d.prepare(`SELECT pn FROM contacts WHERE jid=? AND pn LIKE '%@s.whatsapp.net'`).get(jid)?.pn || jid;
 }
 
 function textOf(m) {
@@ -49,9 +75,9 @@ async function runSocket({ linkMode }) {
   const upContact = d.prepare(`INSERT INTO contacts(jid,name,notify,lid,pn) VALUES(?,?,?,?,?) ON CONFLICT(jid) DO UPDATE SET name=COALESCE(excluded.name,contacts.name), notify=COALESCE(excluded.notify,contacts.notify), lid=COALESCE(excluded.lid,contacts.lid), pn=COALESCE(excluded.pn,contacts.pn)`);
   const insMsg = d.prepare(`INSERT OR IGNORE INTO messages(id,jid,from_me,sender,push_name,ts,type,text) VALUES(?,?,?,?,?,?,?,?)`);
   const saveMsg = (m) => {
-    const jid = m.key?.remoteJid; if (!jid || jid === 'status@broadcast' || !m.message) return null;
+    const jid = lidToPn(d, m.key?.remoteJid, m.key?.remoteJidAlt || m.key?.senderPn); if (!jid || jid === 'status@broadcast' || !m.message) return null;
     const { type, text } = textOf(m); if (type === 'protocolMessage') return null; const ts = tsNum(m.messageTimestamp);
-    const sender = m.key.fromMe ? 'me' : (m.key.participant || jid);
+    const sender = m.key.fromMe ? 'me' : (m.key.participant ? lidToPn(d, m.key.participant, m.key.participantAlt || m.key.participantPn) : jid);
     const r = insMsg.run(m.key.id, jid, m.key.fromMe ? 1 : 0, sender, m.pushName || null, ts, type, text);
     upChat.run(jid, null, ts, null);
     if (m.pushName && !m.key.fromMe) upContact.run(sender, null, m.pushName, null, null);
@@ -65,6 +91,9 @@ async function runSocket({ linkMode }) {
   sock.ev.on('connection.update', async (u) => {
     if (u.qr) { await QRCode.toFile(QR, u.qr, { width: 512 }); console.log(`[${new Date().toISOString()}] QR updated -> ${QR} (scan in WhatsApp > Linked devices)`); }
     if (u.connection === 'open') { console.log(`[${new Date().toISOString()}] connected as ${sock.user?.id?.split(':')[0] || '?'}`); try { fs.unlinkSync(QR); } catch {}
+      (async () => { const lids = d.prepare(`SELECT jid FROM chats WHERE jid LIKE '%@lid' UNION SELECT DISTINCT jid FROM messages WHERE jid LIKE '%@lid'`).all();
+        for (const { jid } of lids) { try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID(jid); if (pn) upContact.run(pn.replace(/:\d+@/, '@'), null, null, jid, pn.replace(/:\d+@/, '@')); } catch {} }
+        mergeLids(d); })();
       fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify({ connected: true, since: Date.now(), me: sock.user?.id || null, name: sock.user?.name || null })); }
     if (u.connection === 'close') {
       const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -77,11 +106,12 @@ async function runSocket({ linkMode }) {
   sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [] }) => {
     d.exec('BEGIN'); for (const c of chats) upChat.run(c.id, c.name || null, tsNum(c.conversationTimestamp) || null, c.unreadCount ?? null);
     for (const c of contacts) upContact.run(c.id, c.name || null, c.notify || null, c.lid || null, c.phoneNumber || null);
-    for (const m of messages) saveMsg(m); d.exec('COMMIT');
+    for (const m of messages) saveMsg(m); d.exec('COMMIT'); mergeLids(d);
     console.log(`history sync: ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs`);
   });
   for (const ev of ['chats.upsert', 'chats.update']) sock.ev.on(ev, (cs) => { for (const c of cs) upChat.run(c.id, c.name || null, tsNum(c.conversationTimestamp) || null, c.unreadCount ?? null); });
   for (const ev of ['contacts.upsert', 'contacts.update']) sock.ev.on(ev, (cs) => { for (const c of cs) upContact.run(c.id, c.name || null, c.notify || null, c.lid || null, c.phoneNumber || null); });
+  sock.ev.on('lid-mapping.update', (maps) => { for (const { lid, pn } of [].concat(maps || [])) if (lid && pn) upContact.run(pn, null, null, lid, pn); mergeLids(d); });
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     for (const m of messages) { const r = saveMsg(m);
       if (r && type === 'notify' && !m.key.fromMe) { const name = d.prepare('SELECT COALESCE(name,notify) n FROM contacts WHERE jid=?').get(r.jid)?.n || d.prepare('SELECT name FROM chats WHERE jid=?').get(r.jid)?.name;

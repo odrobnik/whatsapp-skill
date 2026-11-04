@@ -2,7 +2,7 @@
 name: whatsapp-skill
 description: "Read and send messages on the user's personal WhatsApp through a WhatsApp Web linked device (Baileys). Link once by scanning a QR code (written as a PNG). A long-running daemon stores chats, contacts and messages, including the initial history sync, in a local SQLite store and appends every new inbound message to inbox.jsonl so the agent can poll for new messages and react. Commands: link, daemon, status, chats, read, search, new, and send, which only shows a preview until run again with --yes. No read receipts, presence stays offline. State lives owner-only in ~/.wa-bridge (or WA_BRIDGE_DIR). Every read command can print JSON (--json). Unofficial client: WhatsApp may ban accounts that automate sending. Use when the user asks to read their WhatsApp chats, check for new WhatsApp messages, react to messages from friends, or send a WhatsApp message on their behalf."
 summary: "Personal WhatsApp via a linked device: QR link, daemon with SQLite store, inbox polling, and sending with a preview first."
-version: 1.0.0
+version: 1.0.1
 homepage: https://github.com/odrobnik/whatsapp-skill
 compatibility: "Node.js 22.13+ (built-in node:sqlite) and npm to install Baileys once. Linux or macOS. Works in OpenClaw, Claude Code, Codex and other agents that read SKILL.md."
 permissions:
