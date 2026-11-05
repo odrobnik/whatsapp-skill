@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-skill",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "WhatsApp linked-device CLI and daemon for agent skills (Baileys)",
   "main": "index.js",
   "scripts": {

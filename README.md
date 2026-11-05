@@ -46,3 +46,10 @@ This is an unofficial WhatsApp Web client and is not affiliated with WhatsApp or
 ## License
 
 MIT
+
+## Reliability (1.0.2)
+- Keep-alive ping every 15s, 30s connect timeout; old socket fully closed before reconnect; exponential backoff 2s→60s (reset on open); overlapping reconnects guarded.
+- Watchdog: if not `open` for 2 min, tear down and reconnect. `kill -USR2 <pid>` forces a reconnect (test).
+- Run under the supervisor: `scripts/wa-supervise.sh --ensure` (idempotent; restarts the daemon on crash with backoff, stops on exit 2 = logged out). The box has no systemd/cron, so call `--ensure` after a reboot or from a periodic check.
+- Single instance via `daemon.pid` (second daemon exits 3).
+- Offline check: `node scripts/wa.mjs status --json` → `connected`, `offline_minutes`, `last_code`, `reconnects`; raw data in `~/.wa-bridge/status.json` (`connected`, `since`, `disconnected_since`, ms epoch).

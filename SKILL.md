@@ -67,3 +67,6 @@ Poll `wa new --json`, for example from a scheduled routine, or tail `~/.wa-bridg
 ## Unlink
 
 Remove the device on the phone (Linked devices), stop the daemon, and delete the state folder.
+
+## Keeping it running
+Start/ensure with `scripts/wa-supervise.sh --ensure` (not plain nohup). Health: `wa status --json` → alert if `connected` is false and `offline_minutes > 15`.

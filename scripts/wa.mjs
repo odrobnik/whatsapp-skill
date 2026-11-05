@@ -67,7 +67,30 @@ function textOf(m) {
 const tsNum = (t) => typeof t === 'number' ? t : t?.toNumber ? t.toNumber() : Number(t || 0);
 
 // ---------- daemon / link ----------
-async function runSocket({ linkMode }) {
+const STATUS = path.join(HOME, 'status.json');
+const ts_ = () => `[${new Date().toISOString()}]`;
+const RC = { sock: null, timer: null, backoff: 2000, pending: false, connecting: false, lastOpen: 0, connectStart: 0, gen: 0,
+  st: { connected: false, since: null, disconnected_since: Date.now(), last_code: null, reconnects: 0 } };
+function writeStatus(extra = {}) { Object.assign(RC.st, extra, { updated: Date.now(), pid: process.pid });
+  try { fs.writeFileSync(STATUS + '.tmp', JSON.stringify(RC.st)); fs.renameSync(STATUS + '.tmp', STATUS); } catch {} }
+function teardown() {
+  clearInterval(RC.timer); RC.timer = null; const s = RC.sock; RC.sock = null;
+  if (!s) return;
+  try { s.ev.removeAllListeners(); } catch {}
+  try { s.end(undefined); } catch {} try { s.ws?.close(); } catch {}
+}
+function scheduleReconnect(why, opts) {
+  if (RC.pending) return; RC.pending = true; teardown();
+  const delay = RC.backoff; RC.backoff = Math.min(RC.backoff * 2, 60000); RC.st.reconnects++;
+  console.log(`${ts_()} ${why}; reconnecting in ${delay / 1000}s`);
+  setTimeout(() => { RC.pending = false; runSocket(opts).catch(e => { console.error(ts_(), 'socket start failed:', e?.message || e); scheduleReconnect('start failed', opts); }); }, delay);
+}
+let watchdogStarted = false;
+function startWatchdog(opts) {
+  if (watchdogStarted) return; watchdogStarted = true;
+  setInterval(() => { if (!RC.st.connected && !RC.pending && RC.connectStart && Date.now() - RC.connectStart > 120000) scheduleReconnect('watchdog: not open for 2 min', opts); }, 15000).unref?.();
+}
+async function runSocket(opts) { const { linkMode } = opts || {}; teardown(); RC.connectStart = Date.now(); startWatchdog(opts || {}); const gen = ++RC.gen;
   const B = await import('baileys'); const makeWASocket = B.default; const { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers } = B;
   const pino = (await import('pino')).default; const QRCode = (await import('qrcode')).default;
   const d = db(); fs.mkdirSync(OUTBOX, { recursive: true, mode: 0o700 });
@@ -86,21 +109,23 @@ async function runSocket({ linkMode }) {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({}));
   const sock = makeWASocket({ auth: state, version, logger: pino({ level: process.env.WA_LOG || 'silent' }), printQRInTerminal: false,
-    browser: Browsers.macOS('Chrome'), syncFullHistory: true, markOnlineOnConnect: false, shouldSyncHistoryMessage: () => true });
+    browser: Browsers.macOS('Chrome'), syncFullHistory: true, markOnlineOnConnect: false, shouldSyncHistoryMessage: () => true,
+    keepAliveIntervalMs: 15000, connectTimeoutMs: 30000, defaultQueryTimeoutMs: 60000 });
+  RC.sock = sock;
   sock.ev.on('creds.update', async () => { await saveCreds(); try { for (const f of fs.readdirSync(AUTH)) fs.chmodSync(path.join(AUTH, f), 0o600); } catch {} });
   sock.ev.on('connection.update', async (u) => {
+    if (gen !== RC.gen) return;
     if (u.qr) { await QRCode.toFile(QR, u.qr, { width: 512 }); console.log(`[${new Date().toISOString()}] QR updated -> ${QR} (scan in WhatsApp > Linked devices)`); }
     if (u.connection === 'open') { console.log(`[${new Date().toISOString()}] connected as ${sock.user?.id?.split(':')[0] || '?'}`); try { fs.unlinkSync(QR); } catch {}
       (async () => { const lids = d.prepare(`SELECT jid FROM chats WHERE jid LIKE '%@lid' UNION SELECT DISTINCT jid FROM messages WHERE jid LIKE '%@lid'`).all();
         for (const { jid } of lids) { try { const pn = await sock.signalRepository?.lidMapping?.getPNForLID(jid); if (pn) upContact.run(pn.replace(/:\d+@/, '@'), null, null, jid, pn.replace(/:\d+@/, '@')); } catch {} }
         mergeLids(d); })();
-      fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify({ connected: true, since: Date.now(), me: sock.user?.id || null, name: sock.user?.name || null })); }
+      RC.backoff = 2000; writeStatus({ connected: true, since: Date.now(), disconnected_since: null, me: sock.user?.id || null, name: sock.user?.name || null }); }
     if (u.connection === 'close') {
       const code = u.lastDisconnect?.error?.output?.statusCode;
-      fs.writeFileSync(path.join(HOME, 'status.json'), JSON.stringify({ connected: false, at: Date.now(), code }));
-      if (code === DisconnectReason.loggedOut) { console.error('Logged out (device unlinked). Run `wa link` again.'); process.exit(2); }
-      console.log(`connection closed (code ${code}), reconnecting in 3s`); setTimeout(() => runSocket({ linkMode }).catch(e => { console.error(e); process.exit(1); }), 3000);
-      clearInterval(timer);
+      writeStatus({ connected: false, disconnected_since: RC.st.connected || !RC.st.disconnected_since ? Date.now() : RC.st.disconnected_since, last_code: code ?? null });
+      if (code === DisconnectReason.loggedOut) { writeStatus({ logged_out: true }); console.error('Logged out (device unlinked). Run `wa link` again.'); teardown(); process.exit(2); }
+      scheduleReconnect(`connection closed (code ${code})`, opts);
     }
   });
   sock.ev.on('messaging-history.set', ({ chats = [], contacts = [], messages = [] }) => {
@@ -118,7 +143,7 @@ async function runSocket({ linkMode }) {
         fs.appendFileSync(INBOX, JSON.stringify({ ...r, chat_name: name || null, group: r.jid.endsWith('@g.us') }) + '\n', { mode: 0o600 }); } }
   });
   // Outbox: `wa send --yes` drops a JSON file here; the daemon (owner of the socket) sends it.
-  const timer = setInterval(async () => {
+  RC.timer = setInterval(async () => {
     if (!sock.user) return;
     for (const f of fs.readdirSync(OUTBOX).filter(f => f.endsWith('.json'))) {
       const p = path.join(OUTBOX, f); let job; try { job = JSON.parse(fs.readFileSync(p, 'utf8')); fs.renameSync(p, p + '.sending'); } catch { continue; }
@@ -128,7 +153,6 @@ async function runSocket({ linkMode }) {
       fs.unlinkSync(p + '.sending');
     }
   }, 1000);
-  if (linkMode !== false) fs.writeFileSync(PIDF, String(process.pid));
 }
 
 // ---------- read-side helpers ----------
@@ -154,7 +178,7 @@ const msgLine = (d) => (m) => `${fmt(m.ts)}  ${m.from_me ? 'me' : (m.push_name |
 const HELP = `wa — WhatsApp skill (Baileys linked device)
   wa link                     link via QR (PNG at ${QR}, refreshes); keeps running as daemon after connect
   wa daemon                   run the socket: stores history/messages/chats/contacts, appends inbound to inbox.jsonl, sends outbox
-  wa status                   link/daemon status and store counts
+  wa status                   link/daemon status, connected, offline_minutes, store counts
   wa chats [--limit N]        recent chats
   wa read <name|jid> [-n N]   last N messages of a chat (default 20)
   wa search <text> [-n N]     full-text-ish search over stored messages
@@ -166,6 +190,14 @@ async function main() {
   if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') return console.log(HELP);
   if (cmd === 'link' || cmd === 'daemon') {
     if (cmd === 'daemon' && !fs.existsSync(path.join(AUTH, 'creds.json'))) { console.error('Not linked yet. Run `wa link` first.'); process.exit(1); }
+    let old = null; try { old = Number(fs.readFileSync(PIDF, 'utf8')); process.kill(old, 0); } catch { old = null; }
+    if (old && old !== process.pid) { console.error(`daemon already running (pid ${old})`); process.exit(3); }
+    fs.writeFileSync(PIDF, String(process.pid));
+    const cleanup = () => { try { if (Number(fs.readFileSync(PIDF, 'utf8')) === process.pid) fs.unlinkSync(PIDF); } catch {} };
+    process.on('exit', () => { RC.st.connected = false; if (!RC.st.disconnected_since) RC.st.disconnected_since = Date.now(); writeStatus({ stopped: true }); cleanup(); });
+    process.on('SIGUSR2', () => { writeStatus({ connected: false, disconnected_since: Date.now(), last_code: 'SIGUSR2' }); scheduleReconnect('SIGUSR2: forced reconnect (test)', {}); });
+    for (const sg of ['SIGTERM', 'SIGINT']) process.on(sg, () => { teardown(); process.exit(0); });
+    writeStatus({ connected: false, disconnected_since: Date.now(), started: Date.now(), stopped: false, logged_out: false });
     return runSocket({});
   }
   const d = db();
@@ -173,7 +205,8 @@ async function main() {
     const linked = fs.existsSync(path.join(AUTH, 'creds.json')); let st = {}; try { st = JSON.parse(fs.readFileSync(path.join(HOME, 'status.json'), 'utf8')); } catch {}
     let pid = null; try { pid = Number(fs.readFileSync(PIDF, 'utf8')); process.kill(pid, 0); } catch { pid = null; }
     const c = (t) => d.prepare(`SELECT COUNT(*) n FROM ${t}`).get().n;
-    const s = { linked, daemon_pid: pid, connected: pid ? !!st.connected : false, me: st.me ? st.me.split(':')[0] : null, chats: c('chats'), contacts: c('contacts'), messages: c('messages') };
+    const s = { linked, daemon_pid: pid, connected: pid ? !!st.connected : false, connected_since: st.connected && pid ? new Date(st.since).toISOString() : null,
+      offline_minutes: pid && st.connected ? 0 : Math.round((Date.now() - (pid ? st.disconnected_since : Math.min(st.disconnected_since || st.updated || Date.now(), st.updated || Date.now()))) / 60000), last_code: st.last_code ?? null, reconnects: st.reconnects ?? null, me: st.me ? st.me.split(':')[0] : null, chats: c('chats'), contacts: c('contacts'), messages: c('messages') };
     return console.log(JSONOUT ? JSON.stringify(s) : Object.entries(s).map(([k, v]) => `${k}: ${v}`).join('\n'));
   }
   if (cmd === 'chats') return out(d.prepare('SELECT jid, last_ts, unread FROM chats ORDER BY last_ts DESC LIMIT ?').all(Number(opt('--limit', 30))).map(r => ({ ...r, name: nameOf(d, r.jid) })),
